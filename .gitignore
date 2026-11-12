@@ -1,0 +1,16 @@
+# Artefactos de despliegue
+packaged.yaml
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Configuración generada por el stack (no se versiona)
+frontend/config.js
+
+# Sistema / herramientas
+.DS_Store
+.agents/

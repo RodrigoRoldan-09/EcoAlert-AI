@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="EcoAlert AI: reporta incidentes de contaminación ambiental y clasifica su gravedad con Amazon Comprehend y Amazon Bedrock.">
+  <meta name="theme-color" content="#2E7D32">
+  <title>EcoAlert AI · Reporta incidentes ambientales</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%232E7D32' d='M17 8C8 10 5.9 16.2 3.8 21.3l1.9.7 1-2.3c.5.2 1 .3 1.3.3C19 20 22 3 22 3c-1 2-8 2.3-13 3.3S2 11.5 2 13.5s1.8 3.8 1.8 3.8C7 8 17 8 17 8z'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#contenido">Saltar al contenido</a>
+
+  <header class="site-header">
+    <div class="contenedor header-inner">
+      <div class="marca">
+        <svg class="marca-logo" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <path fill="currentColor" d="M17 8C8 10 5.9 16.2 3.8 21.3l1.9.7 1-2.3c.5.2 1 .3 1.3.3C19 20 22 3 22 3c-1 2-8 2.3-13 3.3S2 11.5 2 13.5s1.8 3.8 1.8 3.8C7 8 17 8 17 8z"/>
+        </svg>
+        <div>
+          <p class="marca-nombre">EcoAlert AI</p>
+          <p class="marca-tag">IA aplicada al cuidado ambiental</p>
+        </div>
+      </div>
+      <ul class="pills" aria-label="Servicios de IA utilizados">
+        <li>Amazon Comprehend</li>
+        <li>Amazon Bedrock</li>
+        <li>Amazon SES</li>
+      </ul>
+    </div>
+  </header>
+
+  <main id="contenido" class="contenedor">
+    <section class="hero" aria-labelledby="titulo-principal">
+      <h1 id="titulo-principal">Reporta un incidente de contaminación</h1>
+      <p class="hero-texto">La app evalúa su gravedad con dos modelos de IA, extrae la ubicación y alerta por correo cuando el caso es grave.</p>
+      <ul class="leyenda" aria-label="Niveles de gravedad">
+        <li><span class="badge badge--BAJA">BAJA</span> Sin riesgo inmediato</li>
+        <li><span class="badge badge--MEDIA">MEDIA</span> Requiere seguimiento</li>
+        <li><span class="badge badge--ALTA">ALTA</span> Se envía alerta por correo</li>
+      </ul>
+    </section>
+
+    <section class="tarjeta" aria-labelledby="titulo-form">
+      <h2 id="titulo-form" class="sr-only">Formulario de reporte</h2>
+      <form id="form-reporte" novalidate>
+        <label for="texto" class="etiqueta">Describe el incidente</label>
+        <textarea id="texto" name="texto" maxlength="2000" rows="6" required
+          aria-describedby="ayuda-texto contador"
+          placeholder="Ej.: Una fábrica vierte residuos químicos al río Lerma, en Toluca…"></textarea>
+        <div class="form-meta">
+          <p id="ayuda-texto" class="ayuda">Incluye qué ocurre y dónde (ciudad, río, colonia…). Máximo 2000 caracteres.</p>
+          <span id="contador" class="contador" aria-live="polite">0 / 2000</span>
+        </div>
+        <p id="error-form" class="error" role="alert" hidden></p>
+
+        <fieldset class="ejemplos">
+          <legend>Ejemplos rápidos</legend>
+          <div class="ejemplos-lista">
+            <button type="button" class="ejemplo" data-texto="Una fábrica está vertiendo residuos químicos al río Lerma, en Toluca; hay peces muertos y un olor muy fuerte.">
+              <span class="badge badge--ALTA">ALTA</span> Vertido químico en el río Lerma
+            </button>
+            <button type="button" class="ejemplo" data-texto="Desde hace una semana queman basura a cielo abierto en un terreno baldío de Iztapalapa y el humo llega a las casas.">
+              <span class="badge badge--MEDIA">MEDIA</span> Quema de basura en Iztapalapa
+            </button>
+            <button type="button" class="ejemplo" data-texto="Vi algunas bolsas de basura junto a un contenedor en el parque Los Colomos de Guadalajara.">
+              <span class="badge badge--BAJA">BAJA</span> Basura en Los Colomos
+            </button>
+          </div>
+        </fieldset>
+
+        <button type="submit" id="btn-enviar" class="btn-primario">
+          <span class="spinner" aria-hidden="true"></span>
+          <span id="btn-texto">Analizar reporte</span>
+        </button>
+      </form>
+    </section>
+
+    <section id="resultados" class="resultados" aria-live="polite" hidden>
+      <h2 id="titulo-resultados" tabindex="-1">Resultado del análisis</h2>
+
+      <div id="aviso-alerta" class="aviso" role="status" hidden></div>
+
+      <article class="tarjeta resumen" aria-labelledby="titulo-resumen">
+        <h3 id="titulo-resumen">Gravedad final</h3>
+        <div class="resumen-grid">
+          <div id="gravedad-final" class="gravedad-final"></div>
+          <dl class="datos">
+            <div><dt>Ubicación</dt><dd id="res-ubicacion"></dd></div>
+            <div><dt>Ticket</dt><dd id="res-ticket" class="mono"></dd></div>
+            <div><dt>Fecha</dt><dd id="res-fecha"></dd></div>
+          </dl>
+        </div>
+        <p class="nota">Regla: se usa la gravedad de Bedrock; si no responde, la de Comprehend.</p>
+      </article>
+
+      <div class="modelos">
+        <article class="tarjeta modelo" aria-labelledby="titulo-comprehend">
+          <header class="modelo-head">
+            <h3 id="titulo-comprehend">Amazon Comprehend</h3>
+            <span class="chip">NLP preentrenado</span>
+          </header>
+          <div id="card-comprehend"></div>
+        </article>
+        <article class="tarjeta modelo" aria-labelledby="titulo-bedrock">
+          <header class="modelo-head">
+            <h3 id="titulo-bedrock">Amazon Bedrock (Claude)</h3>
+            <span class="chip">IA generativa</span>
+          </header>
+          <div id="card-bedrock"></div>
+        </article>
+      </div>
+
+      <article class="tarjeta" aria-labelledby="titulo-tiempos">
+        <h3 id="titulo-tiempos">Tiempo de respuesta</h3>
+        <div id="barras" class="barras"></div>
+      </article>
+
+      <details class="tarjeta json">
+        <summary>Ver respuesta JSON</summary>
+        <pre id="res-json"></pre>
+      </details>
+    </section>
+
+    <section class="tarjeta comparativa" aria-labelledby="titulo-comparativa">
+      <h2 id="titulo-comparativa">¿Qué comparo?</h2>
+      <div class="tabla-scroll">
+        <table>
+          <caption class="sr-only">Comparación entre Amazon Comprehend y Amazon Bedrock</caption>
+          <thead>
+            <tr>
+              <th scope="col">Característica</th>
+              <th scope="col">Amazon Comprehend</th>
+              <th scope="col">Amazon Bedrock (Claude)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><th scope="row">Tipo de modelo</th><td>NLP preentrenado</td><td>Modelo generativo (LLM)</td></tr>
+            <tr><th scope="row">Velocidad</th><td>Muy rápida</td><td>Algo más lenta</td></tr>
+            <tr><th scope="row">Consumo</th><td>Unidades de 100 caracteres</td><td>Tokens de entrada y salida</td></tr>
+            <tr><th scope="row">Cómo decide</th><td>Puntaje de sentimiento negativo</td><td>Razonamiento sobre el texto (prompt)</td></tr>
+            <tr><th scope="row">Extracción de ubicación</th><td>Entidades LOCATION</td><td>La extrae del contexto</td></tr>
+            <tr><th scope="row">Explica su decisión</th><td>No</td><td>Sí</td></tr>
+            <tr><th scope="row">Ideal para</th><td>Alto volumen y bajo costo</td><td>Análisis con matices</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="contenedor">
+      <p>Demo serverless en AWS · S3 · CloudFront · API Gateway · Lambda · DynamoDB</p>
+      <p>Capacitación técnica · Noviembre 2026</p>
+    </div>
+  </footer>
+
+  <script src="config.js"></script>
+  <script src="app.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,454 @@
+# EcoAlert AI - plantilla única de CloudFormation (sin SAM ni CDK).
+#
+# Región objetivo: us-east-1.
+# Despliegue (ver README.md):
+#   aws cloudformation package --template-file template.yaml \
+#     --s3-bucket <bucket-de-artefactos> --output-template-file packaged.yaml
+#   aws cloudformation deploy --template-file packaged.yaml \
+#     --stack-name ecoalert-demo --capabilities CAPABILITY_NAMED_IAM \
+#     --parameter-overrides SenderEmail=<correo-verificado-en-SES>
+#
+# "package" sube la carpeta backend/ a S3 y reemplaza "Code: backend/" por
+# la ubicación S3 del ZIP en packaged.yaml.
+AWSTemplateFormatVersion: '2010-09-09'
+Description: EcoAlert AI - demo serverless (S3 + CloudFront + API Gateway + Lambda + Comprehend + Bedrock + DynamoDB + SES)
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Configuración general
+        Parameters:
+          - ProjectName
+      - Label:
+          default: Alertas e IA
+        Parameters:
+          - SenderEmail
+          - BedrockModelId
+    ParameterLabels:
+      ProjectName:
+        default: Prefijo de nombres
+      SenderEmail:
+        default: Correo remitente (verificado en SES)
+      BedrockModelId:
+        default: ID del modelo o perfil de inferencia de Bedrock
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ecoalert
+    AllowedPattern: '^[a-z][a-z0-9-]{1,20}$'
+    Description: Prefijo en minúsculas para nombrar recursos (función Lambda, API, logs).
+  SenderEmail:
+    Type: String
+    AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    ConstraintDescription: Debe ser una dirección de correo válida.
+    Description: Correo remitente de las alertas. Debe estar verificado en Amazon SES (us-east-1).
+  BedrockModelId:
+    Type: String
+    Default: us.anthropic.claude-haiku-4-5-20251001-v1:0
+    Description: ID del modelo o perfil de inferencia de Claude en Bedrock. Consulta los disponibles con "aws bedrock list-inference-profiles --region us-east-1".
+
+Resources:
+  # ------------------------------------------------------------------
+  # Datos
+  # ------------------------------------------------------------------
+  ReportsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ticketId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ticketId
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ------------------------------------------------------------------
+  # Lambda principal (POST /report)
+  # ------------------------------------------------------------------
+  AnalyzeLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-analyze
+      RetentionInDays: 14
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${ProjectName}-analyze-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt AnalyzeLogGroup.Arn
+              # DetectSentiment/DetectEntities no admiten permisos a nivel de recurso.
+              - Sid: Comprehend
+                Effect: Allow
+                Action:
+                  - comprehend:DetectSentiment
+                  - comprehend:DetectEntities
+                Resource: '*'
+              # Los perfiles de inferencia "us." enrutan a varias regiones de EE. UU.
+              - Sid: Bedrock
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  - !Sub arn:${AWS::Partition}:bedrock:*::foundation-model/*
+                  - !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*
+              - Sid: DynamoDB
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt ReportsTable.Arn
+              - Sid: SesSend
+                Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: !Sub arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/*
+              # ListIdentities/GetIdentityVerificationAttributes no admiten permisos a nivel de recurso.
+              - Sid: SesRead
+                Effect: Allow
+                Action:
+                  - ses:ListIdentities
+                  - ses:GetIdentityVerificationAttributes
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  AnalyzeFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: AnalyzeLogGroup
+    Metadata:
+      cfn-lint:
+        config:
+          # "Code: backend/" es una ruta local que reemplaza "aws cloudformation package".
+          ignore_checks:
+            - W3002
+    Properties:
+      FunctionName: !Sub ${ProjectName}-analyze
+      Description: EcoAlert AI - clasifica reportes con Comprehend y Bedrock, guarda en DynamoDB y alerta con SES
+      Runtime: python3.12
+      Handler: app.handler
+      Code: backend/
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ReportsTable
+          SENDER_EMAIL: !Ref SenderEmail
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          MAX_CHARS: '2000'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ------------------------------------------------------------------
+  # API Gateway (HTTP API) con CORS y throttling
+  # ------------------------------------------------------------------
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub ${ProjectName}-api
+      Description: EcoAlert AI - API de reportes
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - !Sub https://${Distribution.DomainName}
+        AllowMethods:
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - content-type
+        MaxAge: 600
+      Tags:
+        Project: !Ref ProjectName
+
+  ReportIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt AnalyzeFunction.Arn
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 29000
+
+  ReportRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /report
+      Target: !Sub integrations/${ReportIntegration}
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AnalyzeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/POST/report
+
+  # ------------------------------------------------------------------
+  # Sitio web: S3 privado + CloudFront con Origin Access Control
+  # ------------------------------------------------------------------
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${SiteBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt SiteBucket.Arn
+              - !Sub ${SiteBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  SiteOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-oac
+        Description: EcoAlert AI - acceso de CloudFront al bucket del sitio
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: EcoAlert AI
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        IPV6Enabled: true
+        Origins:
+          - Id: s3-site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !GetAtt SiteOAC.Id
+        DefaultCacheBehavior:
+          TargetOriginId: s3-site
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          # Managed-CachingOptimized
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          # Managed-SecurityHeadersPolicy
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ------------------------------------------------------------------
+  # Recurso personalizado: escribe config.js y vacía el bucket al borrar
+  # ------------------------------------------------------------------
+  # Grupo de logs declarado para que delete-stack también lo elimine. El rol no
+  # tiene logs:CreateLogGroup, así que Lambda no puede recrearlo al borrar.
+  SiteConfigLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProjectName}-site-config
+      RetentionInDays: 7
+
+  SiteConfigRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${ProjectName}-site-config-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt SiteConfigLogGroup.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                Resource: !Sub ${SiteBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource: !GetAtt SiteBucket.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  SiteConfigFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: SiteConfigLogGroup
+    Properties:
+      FunctionName: !Sub ${ProjectName}-site-config
+      Description: EcoAlert AI - escribe config.js en el bucket y lo vacía al eliminar el stack
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      MemorySize: 128
+      Role: !GetAtt SiteConfigRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          s3 = boto3.client("s3")
+
+
+          def vaciar(bucket):
+              pag = s3.get_paginator("list_object_versions")
+              for pagina in pag.paginate(Bucket=bucket):
+                  objs = [{"Key": o["Key"], "VersionId": o["VersionId"]}
+                          for o in pagina.get("Versions", []) + pagina.get("DeleteMarkers", [])]
+                  for i in range(0, len(objs), 1000):
+                      s3.delete_objects(Bucket=bucket,
+                                        Delete={"Objects": objs[i:i + 1000], "Quiet": True})
+
+
+          def handler(event, context):
+              print(json.dumps({"RequestType": event.get("RequestType")}))
+              tipo = event.get("RequestType")
+              props = event.get("ResourceProperties", {})
+              bucket = props.get("BucketName", "")
+              pid = event.get("PhysicalResourceId") or (bucket + "-config")
+              try:
+                  if tipo in ("Create", "Update"):
+                      api = props["ApiUrl"]
+                      body = 'window.ECOALERT_API_URL = "%s";\n' % api
+                      s3.put_object(Bucket=bucket, Key="config.js", Body=body.encode("utf-8"),
+                                    ContentType="application/javascript; charset=utf-8",
+                                    CacheControl="no-cache, max-age=0")
+                  elif tipo == "Delete":
+                      vaciar(bucket)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {"ConfigKey": "config.js"}, pid)
+              except Exception as e:
+                  print("Error:", repr(e))
+                  # Al eliminar nunca se bloquea el borrado del stack.
+                  estado = cfnresponse.SUCCESS if tipo == "Delete" else cfnresponse.FAILED
+                  cfnresponse.send(event, context, estado, {"Error": str(e)[:200]}, pid)
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  SiteConfig:
+    Type: Custom::SiteConfig
+    DependsOn:
+      - ApiStage
+      - SiteBucketPolicy
+    Properties:
+      ServiceToken: !GetAtt SiteConfigFunction.Arn
+      BucketName: !Ref SiteBucket
+      ApiUrl: !Sub https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/report
+
+Outputs:
+  WebsiteURL:
+    Description: URL pública (HTTPS) del sitio web en CloudFront
+    Value: !Sub https://${Distribution.DomainName}
+  ApiUrl:
+    Description: Endpoint POST /report de API Gateway
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/report
+  SiteBucketName:
+    Description: Bucket S3 privado donde se sube el frontend
+    Value: !Ref SiteBucket
+  TableName:
+    Description: Tabla DynamoDB con los tickets
+    Value: !Ref ReportsTable
+  DistributionId:
+    Description: ID de la distribución de CloudFront (para invalidaciones)
+    Value: !Ref Distribution
+  LogGroupName:
+    Description: Grupo de logs de la Lambda principal
+    Value: !Ref AnalyzeLogGroup
